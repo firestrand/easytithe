@@ -18,8 +18,11 @@ Repository = "https://github.com/firestrand/easytithe"
 [dependency-groups]
 dev = ["pytest==9.1.1", "ruff==0.16.10", "ty==0.0.84", "types-requests==2.33.0.20260906"]
 
-[tool.setuptools]
-py-modules = ["easytithe"]
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+easytithe = ["py.typed"]
 
 [tool.uv]
 required-version = "==0.12.22"

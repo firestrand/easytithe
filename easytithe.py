@@ -1,196 +1,205 @@
-#!/usr/bin/python
+"""Python 3 EasyTithe Manager client.
 
-"""Python library for Easy Tithe Manager.
-
-Easy Tithe is an online giving platform for churches and organizations that
-makes accepting, tracking and reporting online tithing and donations, well...
-easy.
-
-The Easy Tithe Manager includes a range of reports, which can be viewed by
-person, transaction, fund and date ranges. Access to the Easy Tithe Manager
-is done through the Easy Tithe website at
-https://www.easytithe.com/cp/default.asp.
-
-Easy Tithe library provides an API for logging into the Easy Tithe Manager
-and accessing contribution data.
-
-Usage:
-  import easytithe
-
-  et = easytithe.EasyTithe('username', 'passsword')
-  contributions = et.GetContributions(
-    start_date='10/6/2013',
-    end_date='10/13/2013')
-  print contributions
+Uses the login/export HTTP contract documented by the original EasyTithe
+client by Alex Ortiz-Rosado. Requests owns cookie handling and TLS validation.
+No network operations occur at import time.
 """
 
-__author__ = 'alexortizrosado@gmail.com (Alex Ortiz-Rosado)'
-
-import cookielib
 import csv
+import io
 import json
-import urllib
-import urllib2
-from HTMLParser import HTMLParser
+from collections.abc import Mapping
+from datetime import datetime
+from html.parser import HTMLParser
+from typing import override
 
+import requests
 
+BASE_URL = "https://www.easytithe.com/cp3o"
 CUSTOM_EXPORT_FORMAT = (
     '[amount][sep]"[txntype]"[sep]"[shortdate]"[sep]"[fund]"[sep][personName]'
     '[sep][email][sep]"[phone]"[sep]"[personid]"'
 )
+CONTRIBUTION_FIELD_NAMES = ("Amount", "Type", "Date", "Fund", "Name", "Email", "Phone", "PersonID")
 
 
-CONTRIBUTION_FIELD_NAMES = (
-    'Amount', 'Type', 'Date', 'Fund', 'Name', 'Email', 'Phone', 'PersonID'
-)
+class EasyTitheError(Exception):
+    """Network or malformed service response."""
 
 
-class UserPermissionError(Exception):
-  """User Permission Error"""
-  pass
+class UserPermissionError(EasyTitheError):
+    """Account cannot access the export profile."""
 
 
-class LoginError(Exception):
-  """Login Error"""
-  pass
+class LoginError(EasyTitheError):
+    """Missing CSRF token or rejected credentials."""
 
 
 class InputParser(HTMLParser):
-  def __init__(self):
-    HTMLParser.__init__(self)
-    self.data = []
+    """Extract the login form's CSRF token without executing HTML."""
 
-  def handle_starttag(self, tag, attributes):
-    if tag != 'input':
-      return
-    self.data.append(dict(attributes))
+    def __init__(self) -> None:
+        super().__init__()
+        self.token: str | None = None
+
+    @override
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = dict(attrs)
+        if tag == "input" and attributes.get("name") == "__RequestVerificationToken":
+            self.token = attributes.get("value")
 
 
-class EasyTithe(object):
-  """Class for EasyTithe giving platform."""
-  def __init__(self, username, password):
-    self.cookie_jar = cookielib.CookieJar()
+class EasyTithe:
+    """Authenticated export client; each instance owns an independent session.
 
-    self.opener = urllib2.build_opener(
-        urllib2.HTTPHandler(debuglevel=0),
-        urllib2.HTTPSHandler(debuglevel=0),
-        urllib2.HTTPCookieProcessor(self.cookie_jar))
-
-    self.opener.addheaders = [(
-        'User-agent', ('Mozilla/4.0 (compatible; MSIE 6.0; '
-                       'Windows NT 5.2; .NET CLR 1.1.4322)'))]
-
-    self._Login(username, password)
-
-    if (self._GetCustomExportFormat() != CUSTOM_EXPORT_FORMAT):
-      self._SaveCustomExportFormat()
-
-  def _GetCookiesAsDict(self):
-    """Returns all cookies as dictionary."""
-    cookies = [(cookie.name, cookie.value) for cookie in self.cookie_jar
-               if not cookie.is_expired()]
-    return dict(cookies)
-
-  def _GetCustomExportFormat(self):
-    """Returns custom profile format under Organization > Data Export."""
-    response = self.opener.open(
-        'https://www.easytithe.com/cp3o/MyAccount/GetExportProfileDetails?'
-        'exportProfileKey=Custom'
-        )
-
-    try:
-      custom_profile = json.loads(response.read())
-      return custom_profile['churchProfile']['formula']
-
-    except ValueError:
-      raise UserPermissionError('Unable to access Data Export. '
-        'Check user\'s permissions. User must have access to Organization > '
-        'Data Export.')
-
-  def _SaveCustomExportFormat(self):
-    """Updates the custom profile format."""
-    form = urllib.urlencode({
-        'exportProfileKey': 'Custom',
-        'data': CUSTOM_EXPORT_FORMAT
-        })
-
-    self.opener.open(
-        'https://www.easytithe.com/cp3o/MyAccount/SaveExportProfileOptions',
-        form)
-
-  def _GetRequestVerificationToken(self):
-    response = self.opener.open(
-        'https://www.easytithe.com/cp3o/Account/Login')
-    parser = InputParser()
-    parser.feed(response.read())
-    parser.close()
-
-    for d in parser.data:
-      if d['name'] != '__RequestVerificationToken':
-        continue
-      return d['value']
-
-  def _Login(self, username, password):
-    """Initial login form."""
-    token = self._GetRequestVerificationToken()
-
-    form = urllib.urlencode({
-        'UserName': username,
-        'Password': password,
-        '__RequestVerificationToken': token
-    })
-
-    response = self.opener.open(
-        'https://www.easytithe.com/cp3o/Account/Login', form)
-
-    cookies = self._GetCookiesAsDict()
-    if 'mbadlogin' in cookies:
-      if cookies['mbadlogin'] == '1':
-        raise LoginError('Login failure. Check username and password.')
-
-  def GetContributions(self, start_date, end_date):
-    """Returns a list of contributions.
-
-    Args:
-      start_date: Starting date range.
-      end_date: Ending date range.
-
-    Returns:
-      List of contributions as dict:
-        [
-          {
-            'Name': 'John Doe',
-            'Phone': '4085551234',
-            'PersonID': '108445'
-            'Fund': 'Offering',
-            'Amount': '$50.00',
-            'Date': '5/31/2015',
-            'Type': 'onCARD',
-            'Email': 'jdoe555@yahoo.com'
-          },
-          {
-            'Name': 'Jane Types',
-            'Phone': '+14085555678',
-            'PersonID': '96551',
-            'Fund': 'Tithes',
-            'Amount': '$250.00',
-            'Date': '5/31/2015',
-            'Type': 'onCARD',
-            'Email': 'janetypes@gmail.com'
-          }
-        ]
-
+    Login occurs during construction for compatibility with the old client.
+    Use a context manager or close() to release its session. No failed writes
+    are retried. Responses are bounded and redirects are rejected.
     """
 
-    form = urllib.urlencode({
-        'exportProfileKey': 'Custom',
-        'sDate': start_date,
-        'eDate': end_date,
-    })
-    url = ('https://www.easytithe.com/cp3o/MyAccount/Export')
-    report_data = self.opener.open(url, form).readlines()
-    contributions = []
-    reader = csv.DictReader(report_data, fieldnames=CONTRIBUTION_FIELD_NAMES)
-    for row in reader:
-      contributions.append(row)
-    return contributions
+    def __init__(
+        self,
+        username: str,
+        password: str,
+        *,
+        timeout: float = 60,
+        max_response_bytes: int = 16 * 1024 * 1024,
+    ) -> None:
+        if not username.strip() or not password:
+            raise ValueError("Username and password are required.")
+        if timeout <= 0 or max_response_bytes < 1:
+            raise ValueError("Timeout and response limit must be positive.")
+        self.timeout = timeout
+        self.max_response_bytes = max_response_bytes
+        self.session = requests.Session()
+        try:
+            self._login(username, password)
+            self._configure_export()
+        except BaseException:
+            # Lifecycle isolation boundary: release resources and propagate all
+            # failures, including cancellation/shutdown signals, unchanged.
+            self.close()
+            raise
+
+    def close(self) -> None:
+        self.session.close()
+
+    def __enter__(self) -> EasyTithe:
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        self.close()
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        data: Mapping[str, str] | None = None,
+        params: Mapping[str, str] | None = None,
+    ) -> bytes:
+        try:
+            with self.session.request(
+                method,
+                BASE_URL + path,
+                data=data,
+                params=params,
+                timeout=self.timeout,
+                verify=True,
+                stream=True,
+                allow_redirects=False,
+            ) as response:
+                if not 200 <= response.status_code < 300:
+                    raise EasyTitheError(f"EasyTithe returned HTTP {response.status_code}.")
+                body = bytearray()
+                for chunk in response.iter_content(chunk_size=64 * 1024):
+                    if len(body) + len(chunk) > self.max_response_bytes:
+                        raise EasyTitheError(
+                            "EasyTithe response exceeds the configured size limit."
+                        )
+                    body.extend(chunk)
+                return bytes(body)
+        except requests.RequestException as error:
+            raise EasyTitheError("EasyTithe request failed.") from error
+
+    def _login(self, username: str, password: str) -> None:
+        page = self._request("GET", "/Account/Login")
+        parser = InputParser()
+        try:
+            parser.feed(page.decode("utf-8-sig"))
+        except UnicodeDecodeError as error:
+            raise LoginError("Invalid login page encoding.") from error
+        finally:
+            parser.close()
+        if not parser.token:
+            raise LoginError("Missing login verification token.")
+        self._request(
+            "POST",
+            "/Account/Login",
+            data={
+                "UserName": username,
+                "Password": password,
+                "__RequestVerificationToken": parser.token,
+            },
+        )
+        if any(
+            cookie.name == "mbadlogin" and cookie.value == "1" for cookie in self.session.cookies
+        ):
+            raise LoginError("EasyTithe rejected the credentials.")
+
+    def _configure_export(self) -> None:
+        content = self._request(
+            "GET", "/MyAccount/GetExportProfileDetails", params={"exportProfileKey": "Custom"}
+        )
+        try:
+            profile: object = json.loads(content)
+        except (ValueError, UnicodeDecodeError, RecursionError) as error:
+            raise UserPermissionError("Unable to access the export profile.") from error
+        if not isinstance(profile, dict):
+            raise UserPermissionError("Invalid export profile.")
+        church_profile = profile.get("churchProfile")
+        if not isinstance(church_profile, dict) or not isinstance(
+            church_profile.get("formula"), str
+        ):
+            raise UserPermissionError("Missing export profile formula.")
+        if church_profile["formula"] != CUSTOM_EXPORT_FORMAT:
+            self._request(
+                "POST",
+                "/MyAccount/SaveExportProfileOptions",
+                data={"exportProfileKey": "Custom", "data": CUSTOM_EXPORT_FORMAT},
+            )
+
+    def GetContributions(self, start_date: str, end_date: str) -> list[dict[str, str]]:
+        """Fetch a bounded CSV report for inclusive MM/DD/YYYY dates.
+
+        Date, amount, and person interpretation belongs to the caller. Malformed
+        row shapes fail rather than returning incomplete financial records.
+        """
+        start = datetime.strptime(start_date, "%m/%d/%Y")
+        end = datetime.strptime(end_date, "%m/%d/%Y")
+        if start > end:
+            raise ValueError("start_date must be on or before end_date.")
+        content = self._request(
+            "POST",
+            "/MyAccount/Export",
+            data={
+                "exportProfileKey": "Custom",
+                "sDate": start_date,
+                "eDate": end_date,
+            },
+        )
+        try:
+            text = content.decode("utf-8-sig")
+        except UnicodeDecodeError as error:
+            raise EasyTitheError("Invalid export encoding.") from error
+        rows: list[dict[str, str]] = []
+        try:
+            for row in csv.reader(io.StringIO(text, newline=""), strict=True):
+                if not row:
+                    continue
+                if len(row) != len(CONTRIBUTION_FIELD_NAMES):
+                    raise EasyTitheError("Invalid export row width.")
+                rows.append(dict(zip(CONTRIBUTION_FIELD_NAMES, row, strict=True)))
+        except csv.Error as error:
+            raise EasyTitheError("Invalid export CSV.") from error
+        return rows
